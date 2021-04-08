@@ -56,7 +56,8 @@ var (
 
 // controllerService represents the controller service of CSI driver
 type controllerService struct {
-	cloud         cloud.Cloud
+	defaultRegion string
+	cloud         map[string]cloud.Cloud
 	inFlight      *internal.InFlight
 	driverOptions *DriverOptions
 }
@@ -82,13 +83,9 @@ func newControllerService(driverOptions *DriverOptions) controllerService {
 		region = metadata.GetRegion()
 	}
 
-	cloud, err := NewCloudFunc(region)
-	if err != nil {
-		panic(err)
-	}
-
 	return controllerService{
-		cloud:         cloud,
+		defaultRegion: region,
+		cloud:         make(map[string]cloud.Cloud),
 		inFlight:      internal.NewInFlight(),
 		driverOptions: driverOptions,
 	}
@@ -118,7 +115,14 @@ func (d *controllerService) CreateVolume(ctx context.Context, req *csi.CreateVol
 		return nil, status.Error(codes.InvalidArgument, errString)
 	}
 
-	disk, err := d.cloud.GetDiskByName(ctx, volName, volSizeBytes)
+	// create a new volume
+	zone := pickAvailabilityZone(req.GetAccessibilityRequirements())
+	region, err := parseRegionFromZone(zone)
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+
+	disk, err := d.cloudForRegion(region).GetDiskByName(ctx, volName, volSizeBytes)
 	if err != nil {
 		switch err {
 		case cloud.ErrNotFound:
@@ -200,6 +204,12 @@ func (d *controllerService) CreateVolume(ctx context.Context, req *csi.CreateVol
 			return nil, status.Error(codes.InvalidArgument, "Error retrieving snapshot from the volumeContentSource")
 		}
 		snapshotID = sourceSnapshot.GetSnapshotId()
+		var snapRegion string
+		snapRegion, snapshotID, _ = d.parseHandle(snapshotID)
+		if snapRegion != region {
+			return nil, status.Errorf(codes.InvalidArgument, "Region for snapshot (%s) different than for volume (%s)", snapRegion, region)
+		}
+
 	}
 
 	// volume exists already
@@ -207,7 +217,7 @@ func (d *controllerService) CreateVolume(ctx context.Context, req *csi.CreateVol
 		if disk.SnapshotID != snapshotID {
 			return nil, status.Errorf(codes.AlreadyExists, "Volume already exists, but was restored from a different snapshot than %s", snapshotID)
 		}
-		return newCreateVolumeResponse(disk), nil
+		return newCreateVolumeResponse(region, disk), nil
 	}
 
 	// check if a request is already in-flight because the CreateVolume API is not idempotent
@@ -217,8 +227,6 @@ func (d *controllerService) CreateVolume(ctx context.Context, req *csi.CreateVol
 	}
 	defer d.inFlight.Delete(req.String())
 
-	// create a new volume
-	zone := pickAvailabilityZone(req.GetAccessibilityRequirements())
 	outpostArn := getOutpostArn(req.GetAccessibilityRequirements())
 
 	// fill volume tags
@@ -245,7 +253,7 @@ func (d *controllerService) CreateVolume(ctx context.Context, req *csi.CreateVol
 		SnapshotID:       snapshotID,
 	}
 
-	disk, err = d.cloud.CreateDisk(ctx, volName, opts)
+	disk, err = d.cloudForRegion(region).CreateDisk(ctx, volName, opts)
 	if err != nil {
 		errCode := codes.Internal
 		if err == cloud.ErrNotFound {
@@ -253,7 +261,7 @@ func (d *controllerService) CreateVolume(ctx context.Context, req *csi.CreateVol
 		}
 		return nil, status.Errorf(errCode, "Could not create volume %q: %v", volName, err)
 	}
-	return newCreateVolumeResponse(disk), nil
+	return newCreateVolumeResponse(region, disk), nil
 }
 
 func (d *controllerService) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest) (*csi.DeleteVolumeResponse, error) {
@@ -262,8 +270,9 @@ func (d *controllerService) DeleteVolume(ctx context.Context, req *csi.DeleteVol
 	if len(volumeID) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Volume ID not provided")
 	}
+	region, volumeID, _ := d.parseHandle(volumeID)
 
-	if _, err := d.cloud.DeleteDisk(ctx, volumeID); err != nil {
+	if _, err := d.cloudForRegion(region).DeleteDisk(ctx, volumeID); err != nil {
 		if err == cloud.ErrNotFound {
 			klog.V(4).Info("DeleteVolume: volume not found, returning with success")
 			return &csi.DeleteVolumeResponse{}, nil
@@ -280,6 +289,7 @@ func (d *controllerService) ControllerPublishVolume(ctx context.Context, req *cs
 	if len(volumeID) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Volume ID not provided")
 	}
+	region, volumeID, _ := d.parseHandle(volumeID)
 
 	nodeID := req.GetNodeId()
 	if len(nodeID) == 0 {
@@ -299,10 +309,10 @@ func (d *controllerService) ControllerPublishVolume(ctx context.Context, req *cs
 		return nil, status.Error(codes.InvalidArgument, errString)
 	}
 
-	if !d.cloud.IsExistInstance(ctx, nodeID) {
+	if !d.cloudForRegion(region).IsExistInstance(ctx, nodeID) {
 		return nil, status.Errorf(codes.NotFound, "Instance %q not found", nodeID)
 	}
-	disk, err := d.cloud.GetDiskByID(ctx, volumeID)
+	disk, err := d.cloudForRegion(region).GetDiskByID(ctx, volumeID)
 	if err != nil {
 		if err == cloud.ErrNotFound {
 			return nil, status.Error(codes.NotFound, "Volume not found")
@@ -311,7 +321,7 @@ func (d *controllerService) ControllerPublishVolume(ctx context.Context, req *cs
 	}
 
 	// If given volumeId already assigned to given node, will directly return current device path
-	devicePath, err := d.cloud.AttachDisk(ctx, volumeID, nodeID)
+	devicePath, err := d.cloudForRegion(region).AttachDisk(ctx, volumeID, nodeID)
 	if err != nil {
 		if err == cloud.ErrVolumeInUse {
 			return nil, status.Error(codes.FailedPrecondition, strings.Join(disk.Attachments, ","))
@@ -331,13 +341,14 @@ func (d *controllerService) ControllerUnpublishVolume(ctx context.Context, req *
 	if len(volumeID) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Volume ID not provided")
 	}
+	region, volumeID, _ := d.parseHandle(volumeID)
 
 	nodeID := req.GetNodeId()
 	if len(nodeID) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Node ID not provided")
 	}
 
-	if err := d.cloud.DetachDisk(ctx, volumeID, nodeID); err != nil {
+	if err := d.cloudForRegion(region).DetachDisk(ctx, volumeID, nodeID); err != nil {
 		if err == cloud.ErrNotFound {
 			return &csi.ControllerUnpublishVolumeResponse{}, nil
 		}
@@ -380,13 +391,14 @@ func (d *controllerService) ValidateVolumeCapabilities(ctx context.Context, req 
 	if len(volumeID) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Volume ID not provided")
 	}
+	region, volumeID, _ := d.parseHandle(volumeID)
 
 	volCaps := req.GetVolumeCapabilities()
 	if len(volCaps) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Volume capabilities not provided")
 	}
 
-	if _, err := d.cloud.GetDiskByID(ctx, volumeID); err != nil {
+	if _, err := d.cloudForRegion(region).GetDiskByID(ctx, volumeID); err != nil {
 		if err == cloud.ErrNotFound {
 			return nil, status.Error(codes.NotFound, "Volume not found")
 		}
@@ -408,6 +420,7 @@ func (d *controllerService) ControllerExpandVolume(ctx context.Context, req *csi
 	if len(volumeID) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Volume ID not provided")
 	}
+	region, volumeID, _ := d.parseHandle(volumeID)
 
 	capRange := req.GetCapacityRange()
 	if capRange == nil {
@@ -420,7 +433,7 @@ func (d *controllerService) ControllerExpandVolume(ctx context.Context, req *csi
 		return nil, status.Error(codes.InvalidArgument, "After round-up, volume size exceeds the limit specified")
 	}
 
-	actualSizeGiB, err := d.cloud.ResizeDisk(ctx, volumeID, newSize)
+	actualSizeGiB, err := d.cloudForRegion(region).ResizeDisk(ctx, volumeID, newSize)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "Could not resize volume %q: %v", volumeID, err)
 	}
@@ -461,7 +474,8 @@ func (d *controllerService) CreateSnapshot(ctx context.Context, req *csi.CreateS
 	if len(volumeID) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Snapshot volume source ID not provided")
 	}
-	snapshot, err := d.cloud.GetSnapshotByName(ctx, snapshotName)
+	region, volumeID, _ := d.parseHandle(volumeID)
+	snapshot, err := d.cloudForRegion(region).GetSnapshotByName(ctx, snapshotName)
 	if err != nil && err != cloud.ErrNotFound {
 		klog.Errorf("Error looking for the snapshot %s: %v", snapshotName, err)
 		return nil, err
@@ -471,7 +485,7 @@ func (d *controllerService) CreateSnapshot(ctx context.Context, req *csi.CreateS
 			return nil, status.Errorf(codes.AlreadyExists, "Snapshot %s already exists for different volume (%s)", snapshotName, snapshot.SourceVolumeID)
 		}
 		klog.V(4).Infof("Snapshot %s of volume %s already exists; nothing to do", snapshotName, volumeID)
-		return newCreateSnapshotResponse(snapshot)
+		return newCreateSnapshotResponse(region, snapshot)
 	}
 
 	snapshotTags := map[string]string{
@@ -489,12 +503,12 @@ func (d *controllerService) CreateSnapshot(ctx context.Context, req *csi.CreateS
 		Tags: snapshotTags,
 	}
 
-	snapshot, err = d.cloud.CreateSnapshot(ctx, volumeID, opts)
+	snapshot, err = d.cloudForRegion(region).CreateSnapshot(ctx, volumeID, opts)
 
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "Could not create snapshot %q: %v", snapshotName, err)
 	}
-	return newCreateSnapshotResponse(snapshot)
+	return newCreateSnapshotResponse(region, snapshot)
 }
 
 func (d *controllerService) DeleteSnapshot(ctx context.Context, req *csi.DeleteSnapshotRequest) (*csi.DeleteSnapshotResponse, error) {
@@ -503,8 +517,9 @@ func (d *controllerService) DeleteSnapshot(ctx context.Context, req *csi.DeleteS
 	if len(snapshotID) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Snapshot ID not provided")
 	}
+	region, snapshotID, _ := d.parseHandle(snapshotID)
 
-	if _, err := d.cloud.DeleteSnapshot(ctx, snapshotID); err != nil {
+	if _, err := d.cloudForRegion(region).DeleteSnapshot(ctx, snapshotID); err != nil {
 		if err == cloud.ErrNotFound {
 			klog.V(4).Info("DeleteSnapshot: snapshot not found, returning with success")
 			return &csi.DeleteSnapshotResponse{}, nil
@@ -520,8 +535,9 @@ func (d *controllerService) ListSnapshots(ctx context.Context, req *csi.ListSnap
 	var snapshots []*cloud.Snapshot
 
 	snapshotID := req.GetSnapshotId()
+	region, snapshotID, _ := d.parseHandle(snapshotID)
 	if len(snapshotID) != 0 {
-		snapshot, err := d.cloud.GetSnapshotByID(ctx, snapshotID)
+		snapshot, err := d.cloudForRegion(region).GetSnapshotByID(ctx, snapshotID)
 		if err != nil {
 			if err == cloud.ErrNotFound {
 				klog.V(4).Info("ListSnapshots: snapshot not found, returning with success")
@@ -543,7 +559,7 @@ func (d *controllerService) ListSnapshots(ctx context.Context, req *csi.ListSnap
 	nextToken := req.GetStartingToken()
 	maxEntries := int64(req.GetMaxEntries())
 
-	cloudSnapshots, err := d.cloud.ListSnapshots(ctx, volumeID, maxEntries, nextToken)
+	cloudSnapshots, err := d.cloudForRegion(region).ListSnapshots(ctx, volumeID, maxEntries, nextToken)
 	if err != nil {
 		if err == cloud.ErrNotFound {
 			klog.V(4).Info("ListSnapshots: snapshot not found, returning with success")
@@ -560,6 +576,46 @@ func (d *controllerService) ListSnapshots(ctx context.Context, req *csi.ListSnap
 		return nil, status.Errorf(codes.Internal, "Could not build ListSnapshotsResponse: %v", err)
 	}
 	return response, nil
+}
+
+// cloudForRegion initializes and caches a new cloud provider in the given region, and panics if this fails
+func (d *controllerService) cloudForRegion(region string) cloud.Cloud {
+	if _, ok := d.cloud[region]; !ok {
+		cloud, err := NewCloudFunc(region)
+		if err != nil {
+			panic(err)
+		}
+		klog.V(4).Infof("Created cloud provider for region %s", region)
+		d.cloud[region] = cloud
+	}
+	return d.cloud[region]
+}
+
+// parseHandle parses a resource handle like us-west-1/vol-abc123 or vol-abc123 into the raw handle and region
+func (d *controllerService) parseHandle(handle string) (string, string, error) {
+	parts := strings.Split(handle, "/")
+	var region string
+	var original string
+	if len(parts) == 1 {
+		region = d.defaultRegion
+		original = parts[0]
+	} else if len(parts) == 2 {
+		region = parts[0]
+		original = parts[1]
+	} else {
+		return "", "", fmt.Errorf("Handle %s has too many parts", handle)
+	}
+	return region, original, nil
+}
+
+// parseRegionFromZone parses an AZ like us-west-1a into the region, us-west-1
+func parseRegionFromZone(zone string) (string, error) {
+	parts := strings.Split(zone, "-")
+	if len(parts) != 3 {
+		return "", fmt.Errorf("Could not parse region from zone %s", zone)
+	}
+	parts[2] = parts[2][0 : len(parts[2])-1]
+	return fmt.Sprintf("%s-%s-%s", parts[0], parts[1], parts[2]), nil
 }
 
 // pickAvailabilityZone selects 1 zone given topology requirement.
@@ -612,7 +668,7 @@ func getOutpostArn(requirement *csi.TopologyRequirement) string {
 	return ""
 }
 
-func newCreateVolumeResponse(disk *cloud.Disk) *csi.CreateVolumeResponse {
+func newCreateVolumeResponse(region string, disk *cloud.Disk) *csi.CreateVolumeResponse {
 	var src *csi.VolumeContentSource
 	if disk.SnapshotID != "" {
 		src = &csi.VolumeContentSource{
@@ -637,7 +693,7 @@ func newCreateVolumeResponse(disk *cloud.Disk) *csi.CreateVolumeResponse {
 
 	return &csi.CreateVolumeResponse{
 		Volume: &csi.Volume{
-			VolumeId:      disk.VolumeID,
+			VolumeId:      fmt.Sprintf("%s/%s", region, disk.VolumeID),
 			CapacityBytes: util.GiBToBytes(disk.CapacityGiB),
 			VolumeContext: map[string]string{},
 			AccessibleTopology: []*csi.Topology{
@@ -650,15 +706,15 @@ func newCreateVolumeResponse(disk *cloud.Disk) *csi.CreateVolumeResponse {
 	}
 }
 
-func newCreateSnapshotResponse(snapshot *cloud.Snapshot) (*csi.CreateSnapshotResponse, error) {
+func newCreateSnapshotResponse(region string, snapshot *cloud.Snapshot) (*csi.CreateSnapshotResponse, error) {
 	ts, err := ptypes.TimestampProto(snapshot.CreationTime)
 	if err != nil {
 		return nil, err
 	}
 	return &csi.CreateSnapshotResponse{
 		Snapshot: &csi.Snapshot{
-			SnapshotId:     snapshot.SnapshotID,
-			SourceVolumeId: snapshot.SourceVolumeID,
+			SnapshotId:     fmt.Sprintf("%s/%s", region, snapshot.SnapshotID),
+			SourceVolumeId: fmt.Sprintf("%s/%s", region, snapshot.SourceVolumeID),
 			SizeBytes:      snapshot.Size,
 			CreationTime:   ts,
 			ReadyToUse:     snapshot.ReadyToUse,

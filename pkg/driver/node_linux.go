@@ -29,10 +29,29 @@ import (
 	"k8s.io/klog"
 )
 
+// extractRawIDFromHandle parses a handle of form vol-abc123 or us-west-1/vol-abc123 into the bare volume ID vol-abc123
+func extractRawIDFromHandle(handle string) (string, error) {
+	parts := strings.Split(handle, "/")
+	var original string
+	if len(parts) == 1 {
+		original = parts[0]
+	} else if len(parts) == 2 {
+		original = parts[1]
+	} else {
+		return "", fmt.Errorf("Handle %s has too many parts", handle)
+	}
+	return original, nil
+}
+
 // findDevicePath finds path of device and verifies its existence
 // if the device is not nvme, return the path directly
 // if the device is nvme, finds and returns the nvme device path eg. /dev/nvme1n1
 func (d *nodeService) findDevicePath(devicePath, volumeID string) (string, error) {
+	volumeID, err := extractRawIDFromHandle(volumeID)
+	if err != nil {
+		return "", err
+	}
+
 	exists, err := d.mounter.PathExists(devicePath)
 	if err != nil {
 		return "", err
